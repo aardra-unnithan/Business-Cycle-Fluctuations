@@ -1,0 +1,1017 @@
+#-------------------------------------------------------
+# PART 1
+#-------------------------------------------------------
+
+
+# ===== Step 1: Imports =====
+import os
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from pandas_datareader import data as pdr
+from statsmodels.tsa.filters.hp_filter import hpfilter
+
+pd.options.display.float_format = "{:,.3f}".format
+plt.style.use('seaborn-v0_8-whitegrid')
+
+print("✅ Imports OK")
+
+# ===== Step 2: Timeframe & FRED codes =====
+start = "2000-01-01"
+end   = "2023-12-31"
+
+CODES = {
+    "GDP": {
+        "US": "GDPC1",
+        "FR": "NGDPRSAXDCFRQ",
+        "JP": "NGDPRSAXDCJPQ"
+    },
+    "U": {
+        "US": "LRUN64TTUSQ156S",
+        "FR": "LRUN64TTFRQ156S",
+        "JP": "LRUN64TTJPQ156S"
+    },
+    "CPI": {
+        "US": "CPALTT01USQ661S",  # index, SA
+        "FR": "CPALTT01FRQ657N",  # growth QoQ, NSA (we'll handle)
+        "JP": "CPALTT01JPQ661S"   # index, SA
+    },
+    "RATE_L": {
+        "US": "IRLTLT01USQ156N",
+        "FR": "IRLTLT01FRQ156N",
+        "JP": "IRLTLT01JPQ156N"
+    },
+    "RATE_S": {
+        "US": "IR3TIB01USQ156N",
+        "FR": "IR3TIB01FRQ156N",
+        "JP": "IR3TIB01JPQ156N"
+    },
+    "INV": {
+        "US": "NAEXKP03USQ661S",
+        "FR": "NAEXKP03FRQ661S",
+        "JP": "NAEXKP03JPQ661S"
+    }
+}
+COUNTRIES = ["US","FR","JP"]
+print("✅ Codes ready")
+
+
+# ===== Step 3: FRED fetch helpers =====
+def fetch_data(var_key):
+    frames = []
+    for ctry, code in CODES[var_key].items():
+        s = pdr.DataReader(code, "fred", start, end)
+        frames.append(s.rename(columns={code: f"{ctry}_{var_key}"}))
+    return pd.concat(frames, axis=1)
+
+def build_quarter_label(df):
+    out = df.reset_index().rename(columns={"DATE":"date"})
+    out["quarter"] = out["date"].dt.to_period("Q").astype(str)
+    return out.set_index("date")
+print("✅ Fetch helpers ready")
+
+# ===== Step 4: Baseline pull from FRED =====
+gdp   = fetch_data("GDP")
+u     = fetch_data("U")
+cpi   = fetch_data("CPI")
+rL    = fetch_data("RATE_L")
+rS    = fetch_data("RATE_S")
+inv   = fetch_data("INV")
+
+df = gdp.join([u, cpi, rL, rS, inv], how="outer").sort_index()
+df = build_quarter_label(df)
+
+print("✅ FRED data assembled")
+print(df.shape)
+df.head(3)
+
+
+# --- Robust CSV loader that tolerates OECD/SDMX metadata, odd delimiters, and quarter strings ---
+import re, os, pandas as pd, numpy as np
+
+def _looks_like_quarter(x):
+    s = str(x).strip().upper()
+    return bool(re.match(r"^\d{4}[-_/ ]?Q[1-4]$|^Q[1-4][-_/ ]?\d{4}$", s))
+
+def _coerce_to_datetime(col):
+    # try normal datetime first
+    try:
+        return pd.to_datetime(col)
+    except Exception:
+        # try quarters like 2020Q1 / 2020-Q1 / Q1-2020
+        s = pd.Series(col).astype(str).str.strip().str.upper()
+        s = (s.str.replace(r"\s+", "", regex=True)
+               .str.replace(r"(\d{4})[-_/]?Q([1-4])", r"\1Q\2", regex=True)
+               .str.replace(r"Q([1-4])[-_/]?(\d{4})", r"\2Q\1", regex=True))
+        per = pd.PeriodIndex(s, freq="Q")
+        return pd.to_datetime(per.to_timestamp(how="end"))
+
+def load_csv_series(file_path):
+    # 1) read raw with delimiter inference, tolerate BOM/Latin-1
+    df = None
+    for enc in ["utf-8-sig","utf-8","latin1"]:
+        try:
+            df = pd.read_csv(file_path, engine="python", sep=None, encoding=enc)
+            break
+        except Exception:
+            continue
+    if df is None:
+        raise RuntimeError("Could not read CSV with common encodings.")
+
+    # 2) drop empty columns; strip whitespace
+    df = df.dropna(how="all", axis=1)
+    df.columns = [c.strip() for c in df.columns]
+
+    # 3) find a date-ish column: prefer known names, else pattern match
+    date_candidates = [c for c in df.columns if c.lower() in
+                       ["date","time","quarter","period","obs_time","time_period"]]
+    if not date_candidates:
+        # heuristic: column whose values mostly look like dates/quarters
+        scores = {}
+        for c in df.columns:
+            vals = df[c].astype(str).head(200)
+            score = 0
+            score += vals.str.contains(r"\d{4}-\d{2}-\d{2}").mean() * 1.0
+            score += vals.map(_looks_like_quarter).mean() * 1.0
+            scores[c] = score
+        date_candidates = [max(scores, key=scores.get)]
+    date_col = date_candidates[0]
+
+    # 4) choose value column: prefer numeric-like, typical names if present
+    non_date = [c for c in df.columns if c != date_col]
+    preferred = [c for c in non_date if re.search(r"(value|obs|index|rate|cpi|gdp|inv|unemp)", c, re.I)]
+    candidates = preferred + non_date
+    val_col = None
+    for c in candidates:
+        try:
+            pd.to_numeric(df[c], errors="raise")
+            val_col = c; break
+        except Exception:
+            continue
+    if val_col is None:
+        val_col = non_date[0]
+        df[val_col] = pd.to_numeric(df[val_col], errors="coerce")
+
+    # 5) coerce date column, build series
+    dt = _coerce_to_datetime(df[date_col])
+    s = pd.Series(pd.to_numeric(df[val_col], errors="coerce").values, index=dt).sort_index()
+    s = s[~s.index.isna()]
+    return s
+
+def merge_csv(file_path, target_col, df):
+    try:
+        extra = load_csv_series(file_path)
+        before = df[target_col].notna().sum() if target_col in df else 0
+        if target_col in df.columns:
+            df[target_col] = df[target_col].combine_first(extra)
+        else:
+            df[target_col] = extra
+        after = df[target_col].notna().sum()
+        last = df[target_col].dropna().index.max()
+        print(f"✅ {os.path.basename(file_path)} → {target_col}: +{after-before} points; last = {last.date() if pd.notna(last) else 'n/a'}")
+    except Exception as e:
+        print(f"❌ {os.path.basename(file_path)} → {target_col}: {repr(e)}")
+
+# === Step 4C re-run with robust loader ===
+csv_map = {
+    "CPI US.csv":            "US_CPI",
+    "CPI FRn NSA.csv":       "FR_CPI",
+    "CPI JPN.csv":           "JP_CPI",
+    "InterestRAte_US.csv":   "US_RATE_L",
+    "InterestRate_FRN.csv":  "FR_RATE_L",
+    "InterestRate_JPN.csv":  "JP_RATE_L",
+    "Investment_USA.csv":    "US_INV",
+    "Investment_FRN.csv":    "FR_INV",
+    "Investment_JPN.csv":    "JP_INV",
+}
+for file, col in csv_map.items():
+    merge_csv(os.path.join(os.getcwd(), file), col, df)
+
+for col in ["US_CPI","FR_CPI","JP_CPI","US_RATE_L","FR_RATE_L","JP_RATE_L","US_INV","FR_INV","JP_INV"]:
+    if col in df.columns:
+        print(col, "→ last:", df[col].dropna().index.max())
+
+# === Step 4D re-run with robust loader ===
+csv_map_gdp_u = {
+    "US Real GDP.csv":  "US_GDP",
+    "FRN Real GDP.csv": "FR_GDP",
+    "JPN Real GDP.csv": "JP_GDP",
+    "USA_unemp.csv":    "US_U",
+    "FRN_unemp.csv":    "FR_U",
+    "JPN_unemp.csv":    "JP_U",
+}
+for file, col in csv_map_gdp_u.items():
+    merge_csv(os.path.join(os.getcwd(), file), col, df)
+
+for col in ["US_GDP","FR_GDP","JP_GDP","US_U","FR_U","JP_U"]:
+    if col in df.columns:
+        print(col, "→ last:", df[col].dropna().index.max(), "non-NA:", df[col].notna().sum())
+
+# Step 4E — Short-term rates (for term spread)
+csv_map_short = {
+    "ShortRate_US.csv":  "US_RATE_S",
+    "ShortRate_FRN.csv": "FR_RATE_S",
+    "ShortRate_JPN.csv": "JP_RATE_S",
+}
+for file, col in csv_map_short.items():
+    merge_csv(os.path.join(os.getcwd(), file), col, df)
+
+# quick check:
+for c in ["US","FR","JP"]:
+    for r in ["RATE_L","RATE_S"]:
+        col = f"{c}_{r}"
+        if col in df.columns:
+            print(col, "→ last:", df[col].dropna().index.max())
+
+# ======================================
+#  STEP 5: Derived Series
+#  HP filter for real variables, Δlog(CPI)*100 for inflation
+# ======================================
+
+from statsmodels.tsa.filters.hp_filter import hpfilter
+import numpy as np
+
+COUNTRIES = ["US","FR","JP"]
+
+# --- helper functions ---
+def safe_log(series):
+    """Return log(series) safely, ignoring <=0."""
+    s = pd.to_numeric(series, errors="coerce")
+    s = s.where(s > 0)
+    return np.log(s)
+
+def hp_cycle(series, lamb=1600, min_points=12):
+    """HP-filter the series and return the cyclical component."""
+    s = pd.to_numeric(series, errors="coerce").dropna()
+    if len(s) < min_points:
+        return pd.Series(index=series.index, dtype="float64")
+    cyc, _ = hpfilter(s, lamb=lamb)
+    return cyc.reindex(series.index)
+
+# ---------- 5A) Inflation ----------
+# Inflation = Δlog(CPI)*100 for US & JP; raw growth*100 for FR
+for c in COUNTRIES:
+    cpi = df[f"{c}_CPI"]
+    if c in ["US", "JP"]:
+        df[f"{c}_INF"] = safe_log(cpi).diff() * 100
+    else:
+        df[f"{c}_INF"] = pd.to_numeric(cpi, errors="coerce") * 100
+
+# ---------- 5B) HP Cycles ----------
+for c in COUNTRIES:
+    # log + HP for real quantities
+    df[f"{c}_GDP_LOG"]   = safe_log(df[f"{c}_GDP"])
+    df[f"{c}_INV_LOG"]   = safe_log(df[f"{c}_INV"])
+    df[f"{c}_GDP_CYCLE"] = hp_cycle(df[f"{c}_GDP_LOG"])
+    df[f"{c}_INV_CYCLE"] = hp_cycle(df[f"{c}_INV_LOG"])
+
+    # HP on levels for unemployment and interest rates
+    df[f"{c}_U_CYCLE"]      = hp_cycle(df[f"{c}_U"])
+    df[f"{c}_RATE_L_CYCLE"] = hp_cycle(df[f"{c}_RATE_L"])
+    if f"{c}_RATE_S" in df.columns:
+        df[f"{c}_RATE_S_CYCLE"] = hp_cycle(df[f"{c}_RATE_S"])
+
+# ---------- 5C) Term Spread (10y − 3m) ----------
+for c in COUNTRIES:
+    if f"{c}_RATE_S" in df.columns:
+        df[f"{c}_SPREAD"]       = df[f"{c}_RATE_L"] - df[f"{c}_RATE_S"]
+        df[f"{c}_SPREAD_CYCLE"] = hp_cycle(df[f"{c}_SPREAD"])
+
+# ---------- 5D) Sanity Check ----------
+def rows_used(country):
+    cols = [f"{country}_GDP_CYCLE",
+            f"{country}_U_CYCLE",
+            f"{country}_INF",
+            f"{country}_INV_CYCLE",
+            f"{country}_SPREAD_CYCLE"]
+    return df[cols].dropna().shape[0]
+
+print("✅ Derived series created successfully.")
+for c in COUNTRIES:
+    print(f"{c}: usable rows →", rows_used(c))
+
+# preview last few derived values
+display(df.filter(regex="(quarter$|_INF$|_CYCLE$|_SPREAD$)").tail(5))
+
+
+# ======================================
+#  STEP 6: Volatility & Correlation Analysis
+# ======================================
+
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+
+COUNTRIES = ["US", "FR", "JP"]
+
+# --- helper for pairwise correlation (avoids NaN bias) ---
+def corr_overlap(a, b):
+    tmp = pd.concat([a, b], axis=1).dropna()
+    return tmp.iloc[:,0].corr(tmp.iloc[:,1]) if len(tmp) else np.nan
+
+# ---------- 6A) Volatility (Standard Deviations) ----------
+def volatility_table(country):
+    """Compute standard deviations for each variable."""
+    variables = ["GDP_CYCLE", "U_CYCLE", "INF", "RATE_L_CYCLE", "SPREAD_CYCLE", "INV_CYCLE"]
+    data = {}
+    for v in variables:
+        col = f"{country}_{v}"
+        if col in df.columns:
+            s = df[col].dropna()
+            data[v] = s.std()
+        else:
+            data[v] = np.nan
+    return pd.Series(data, name=country)
+
+VOL = pd.concat([volatility_table(c) for c in COUNTRIES], axis=1)
+VOL.index = ["GDP Cycle", "Unemployment Cycle", "Inflation", 
+             "Long-term Interest Rate Cycle", "Term Spread Cycle", "Investment Cycle"]
+
+# ---------- 6B) Correlation with GDP Cycle ----------
+def correlation_table(country):
+    """Compute correlation of each variable with GDP cycle."""
+    y = df[f"{country}_GDP_CYCLE"]
+    pairs = {
+        "Unemployment": f"{country}_U_CYCLE",
+        "Inflation": f"{country}_INF",
+        "Long-term Interest Rate": f"{country}_RATE_L_CYCLE",
+        "Term Spread": f"{country}_SPREAD_CYCLE",
+        "Investment": f"{country}_INV_CYCLE"
+    }
+    return pd.Series({k: corr_overlap(df[v], y) for k, v in pairs.items()}, name=country)
+
+CORR = pd.concat([correlation_table(c) for c in COUNTRIES], axis=1)
+
+# ---------- 6C) Display nicely formatted tables ----------
+print("📊 Table 1: Volatility (Standard Deviations)")
+display(VOL.round(3).rename_axis("Variable"))
+
+print("\n📈 Table 2: Correlation with GDP Cycle")
+display(CORR.round(3).rename_axis("Variable"))
+
+# Optional: Export to CSV for report use
+VOL.round(3).to_csv("Volatility_Table.csv")
+CORR.round(3).to_csv("Correlation_with_GDP_Table.csv")
+
+print("\n✅ Tables exported: 'Volatility_Table.csv' and 'Correlation_with_GDP_Table.csv'")
+
+
+# Robustness check: use GDP growth instead of GDP cycle
+for c in ["US","FR","JP"]:
+    df[f"{c}_GDP_GROWTH"] = df[f"{c}_GDP_LOG"].diff() * 100  # Δlog(GDP)×100
+
+def corr_with_gdp_growth(country):
+    y = df[f"{country}_GDP_GROWTH"]
+    pairs = {
+        "Unemployment": f"{country}_U_CYCLE",
+        "Inflation":    f"{country}_INF",
+        "Long-term Interest Rate": f"{country}_RATE_L_CYCLE",
+        "Term Spread":  f"{country}_SPREAD_CYCLE",
+        "Investment":   f"{country}_INV_CYCLE",
+    }
+    return pd.Series(
+        {k: df[v].corr(y) for k, v in pairs.items() if v in df},
+        name=country
+    )
+
+CORR_GROWTH = pd.concat([corr_with_gdp_growth(c) for c in ["US","FR","JP"]], axis=1)
+print("📈 Table 3: Correlation with GDP Growth")
+display(CORR_GROWTH.round(3).rename_axis("Variable"))
+
+
+plt.figure(figsize=(10,5))
+for c in ["US","FR","JP"]:
+    plt.plot(df.index, df[f"{c}_GDP_CYCLE"], label=c)
+plt.title("GDP Cycles (HP-filtered)")
+plt.xlabel("Date"); plt.ylabel("Deviation from Trend")
+plt.legend(); plt.grid(True, linestyle="--", alpha=0.5); plt.tight_layout(); plt.show()
+
+
+import seaborn as sns
+
+for c in ["US","FR","JP"]:
+    tmp = df[[f"{c}_GDP_CYCLE", f"{c}_U_CYCLE"]].dropna()
+    plt.figure(figsize=(5,4))
+    sns.regplot(x=f"{c}_GDP_CYCLE", y=f"{c}_U_CYCLE", data=tmp,
+                scatter_kws={'s':30, 'alpha':0.7}, line_kws={'color':'red', 'lw':2})
+    plt.title(f"GDP Cycle & Unemploymen: {c}")
+    plt.xlabel("GDP Cycle (Deviation from Trend)")
+    plt.ylabel("Unemployment Cycle (Deviation from Trend)")
+    plt.grid(True, linestyle="--", alpha=0.5)
+    plt.tight_layout(); plt.show()
+
+
+for c in ["US","FR","JP"]:
+    fig, ax1 = plt.subplots(figsize=(9,5))
+
+    # left axis → Term spread
+    ax1.plot(df.index, df[f"{c}_SPREAD_CYCLE"], color="orange", linestyle="--", label="Term Spread (p.p.)")
+    ax1.set_ylabel("Term Spread (p.p.)", color="orange")
+    ax1.tick_params(axis='y', colors='orange')
+
+    # right axis → GDP cycle
+    ax2 = ax1.twinx()
+    ax2.plot(df.index, df[f"{c}_GDP_CYCLE"], color="blue", label="GDP Cycle")
+    ax2.set_ylabel("GDP Cycle (Deviation from Trend)", color="blue")
+    ax2.tick_params(axis='y', colors='blue')
+
+    plt.title(f"{c}: GDP vs Term Spread Cycles")
+    fig.legend(loc="upper left", bbox_to_anchor=(0.12,0.9))
+    plt.grid(True, linestyle="--", alpha=0.4)
+    plt.tight_layout(); plt.show()
+
+
+import seaborn as sns
+import matplotlib.pyplot as plt
+
+# Set a consistent style
+sns.set_style("whitegrid")
+
+# Loop through all three countries
+for c in ["US", "FR", "JP"]:
+    tmp = df[[f"{c}_GDP_CYCLE", f"{c}_INV_CYCLE"]].dropna()
+
+    plt.figure(figsize=(5.5, 4.5))
+    sns.regplot(
+        x=f"{c}_GDP_CYCLE", 
+        y=f"{c}_INV_CYCLE", 
+        data=tmp,
+        scatter_kws={'s':30, 'alpha':0.7},        # dot size and transparency
+        line_kws={'color':'red', 'linewidth':2}   # regression line style
+    )
+    
+    plt.title(f"Investment vs GDP Cycle: {c}", fontsize=12, weight="bold")
+    plt.xlabel("GDP Cycle (Deviation from Trend)")
+    plt.ylabel("Investment Cycle (Deviation from Trend)")
+    plt.grid(True, linestyle="--", alpha=0.5)
+    plt.tight_layout()
+    plt.show()
+
+for c in ["US","FR","JP"]:
+    fig, ax1 = plt.subplots(figsize=(9,5))
+    ax1.plot(df.index, df[f"{c}_GDP_CYCLE"], label="GDP Cycle", color="blue")
+    ax2 = ax1.twinx()
+    ax2.plot(df.index, df[f"{c}_INF"], label="Inflation", color="red", linestyle="--")
+
+    ax1.set_xlabel("Date")
+    ax1.set_ylabel("GDP Cycle", color="blue")
+    ax2.set_ylabel("Inflation (Δlog CPI×100)", color="red")
+    plt.title(f"{c}: GDP Cycle and Inflation over Time")
+    fig.legend(loc="upper right", bbox_to_anchor=(0.9, 0.9))
+    plt.grid(True, linestyle="--", alpha=0.4)
+    plt.tight_layout(); plt.show()
+
+
+VOL.T.plot(kind="bar", figsize=(9,5))
+plt.title("Volatility of Macroeconomic Variables")
+plt.ylabel("Standard Deviation"); plt.grid(True, linestyle="--", alpha=0.5)
+plt.tight_layout(); plt.show()
+
+#----------------------------------------------
+#PART 2: Country Specific Analysis: JAPAN
+#----------------------------------------------
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+plt.rcParams["figure.dpi"] = 120
+plt.rcParams["axes.grid"] = True
+
+# ---- Recession periods (shaded) ----
+REC_GFC_START,   REC_GFC_END   = pd.Timestamp("2008-01-01"), pd.Timestamp("2009-03-31")  # 2008Q1–2009Q1
+REC_COVID_START, REC_COVID_END = pd.Timestamp("2020-01-01"), pd.Timestamp("2020-06-30")  # 2020Q1–2020Q2
+
+# ---- Your PRE & RECOVERY blocks (for base indexing & narrative) ----
+GFC_PRE_START,   GFC_PRE_END   = pd.Timestamp("2006-07-01"), pd.Timestamp("2007-12-31")  # 2006Q3–2007Q4
+GFC_REC_START,   GFC_REC_END   = pd.Timestamp("2009-04-01"), pd.Timestamp("2010-12-31")  # 2009Q2–2010Q4
+COVID_PRE_START, COVID_PRE_END = pd.Timestamp("2018-07-01"), pd.Timestamp("2019-12-31")  # 2018Q3–2019Q4
+COVID_REC_START, COVID_REC_END = pd.Timestamp("2020-07-01"), pd.Timestamp("2021-12-31")  # 2020Q3–2021Q4
+
+# ---- Plot windows that cover PRE + RECESSION + RECOVERY ----
+WIN_GFC_START,   WIN_GFC_END   = GFC_PRE_START,   GFC_REC_END
+WIN_COVID_START, WIN_COVID_END = COVID_PRE_START, COVID_REC_END
+
+# Data end safeguard (in case your df ends earlier)
+DATA_END = df.index.max()
+
+
+from pathlib import Path
+
+def read_two_col_csv(pathlike):
+    """
+    Expects first column = date, second = value.
+    Returns a Series with DatetimeIndex.
+    """
+    p = Path(pathlike)
+    if not p.exists():
+        print(f"⚠️ Missing file: {p.name}")
+        return None
+    t = pd.read_csv(p).dropna(how="all")
+    if t.shape[1] < 2:
+        print(f"⚠️ {p.name}: need at least 2 columns (date, value)")
+        return None
+    s = t.iloc[:,1]  # value
+    s.index = pd.to_datetime(t.iloc[:,0], errors="coerce")
+    s = pd.to_numeric(s, errors="coerce").dropna()
+    s = s.sort_index()
+    return s
+
+def to_quarterly_mean(series):
+    """Monthly/daily → quarterly average; if already quarterly, align to quarter end."""
+    if series is None or series.empty:
+        return series
+    # If median gap < 60 days, assume monthly→quarterly mean
+    diffs = series.index.to_series().diff().dropna().dt.days.median()
+    if pd.notna(diffs) and diffs < 60:
+        q = series.resample("QE").mean()
+    else:
+        q = series.copy()
+        q.index = q.index.to_period("Q").to_timestamp("Q")
+    return q
+
+# Read your two files
+exports_q = to_quarterly_mean(read_two_col_csv("Exports_JPN.csv"))      # Real exports (level)
+bconf_q   = to_quarterly_mean(read_two_col_csv("Business_JPN.csv"))     # Business confidence (index)
+
+# Merge into df
+if exports_q is not None:
+    df["JP_EXPORTS"] = exports_q
+else:
+    print("⚠️ JP_EXPORTS not loaded.")
+
+if bconf_q is not None:
+    df["JP_BCI"] = bconf_q
+else:
+    print("⚠️ JP_BCI not loaded.")
+
+# Ensure master index is quarterly and sorted
+df.index = df.index.to_period("Q").to_timestamp("Q")
+df = df.sort_index()
+
+COUNTRY = "JP"
+
+# Check required Part-1 columns
+required = [f"{COUNTRY}_GDP_LOG", f"{COUNTRY}_INV_LOG", f"{COUNTRY}_U",
+            f"{COUNTRY}_INF", f"{COUNTRY}_RATE_L", f"{COUNTRY}_RATE_S"]
+missing = [c for c in required if c not in df.columns]
+if missing:
+    print("⚠️ Missing core columns:", missing)
+
+# Levels from logs (for base=100 indexing)
+df[f"{COUNTRY}_GDP_LVL"] = np.exp(df[f"{COUNTRY}_GDP_LOG"])
+df[f"{COUNTRY}_INV_LVL"] = np.exp(df[f"{COUNTRY}_INV_LOG"])
+
+# Term spread (if absent)
+if f"{COUNTRY}_SPREAD" not in df.columns:
+    df[f"{COUNTRY}_SPREAD"] = df[f"{COUNTRY}_RATE_L"] - df[f"{COUNTRY}_RATE_S"]
+
+
+def slice_window(full_index, win_start, win_end, rec_start, rec_end):
+    """Return analysis window index and recession slice aligned to df.index."""
+    win_end = min(win_end, DATA_END)
+    w_lo = full_index.get_indexer([win_start], method="nearest")[0]
+    w_hi = full_index.get_indexer([win_end],   method="nearest")[0]
+    r_lo = full_index.get_indexer([rec_start], method="nearest")[0]
+    r_hi = full_index.get_indexer([rec_end],   method="nearest")[0]
+    win_idx = full_index[w_lo:w_hi+1]
+    rec_idx = full_index[r_lo:r_hi+1]
+    rec_idx = rec_idx[(rec_idx >= win_idx[0]) & (rec_idx <= win_idx[-1])]
+    return win_idx, rec_idx
+
+def to_index_100(level_series, base_date):
+    """Index a LEVEL series to 100 at last non-NA obs on/before base_date."""
+    s = pd.to_numeric(level_series, errors="coerce")
+    base_obs = s.loc[:base_date].dropna()
+    if base_obs.empty:
+        return pd.Series(np.nan, index=s.index)
+    base_val = base_obs.iloc[-1]
+    return (s / base_val) * 100
+
+def qdiff(a, b):
+    if (a is None) or (b is None):
+        return np.nan
+    return (pd.Period(b, 'Q') - pd.Period(a, 'Q')).n
+
+def peak_trough_recovery(level_series, rec_start, rec_end):
+    """Peak→trough (%) vs base, quarters to trough & recovery."""
+    s = pd.to_numeric(level_series, errors="coerce")
+    base_date = s.loc[:rec_start].dropna().index.max() if len(s.loc[:rec_start].dropna()) else None
+    if base_date is None:
+        return (np.nan, np.nan, np.nan, None, None)
+    base_val = s.loc[:base_date].dropna().iloc[-1]
+    rec_slice = s.loc[rec_start:rec_end]
+    if rec_slice.empty:
+        return (np.nan, np.nan, np.nan, None, None)
+    trough_date = rec_slice.idxmin()
+    trough_val  = rec_slice.min()
+    drawdown = (trough_val/base_val - 1.0) * 100
+    post = s.loc[rec_end:]
+    rec_date = post[post >= base_val].dropna().index.min() if len(post.dropna()) else None
+    return (round(drawdown,2), qdiff(base_date, trough_date), qdiff(base_date, rec_date), trough_date, rec_date)
+
+
+
+def run_event(name, win_start, win_end, rec_start, rec_end, pre_start, pre_end):
+    # Indices
+    win_idx, rec_idx = slice_window(df.index, win_start, win_end, rec_start, rec_end)
+    if len(win_idx)==0 or len(rec_idx)==0:
+        print(f"⚠️ No data window for {name}."); return None
+
+    # Base date = last obs in PRE period (your choice)
+    pre_slice = df.loc[pre_start:pre_end]
+    base_date = pre_slice.index.max() if not pre_slice.empty else df.loc[:rec_start].index.max()
+
+    # Build working frame
+    d = pd.DataFrame(index=win_idx)
+    d["GDP_idx"] = to_index_100(df["JP_GDP_LVL"], base_date)
+    d["INV_idx"] = to_index_100(df["JP_INV_LVL"], base_date)
+    d["EXP_idx"] = to_index_100(df["JP_EXPORTS"], base_date) if "JP_EXPORTS" in df.columns else np.nan
+    d["U"]       = df["JP_U"]
+    d["INF"]     = df["JP_INF"]
+    d["RateL"]   = df["JP_RATE_L"]
+    d["Spread"]  = df["JP_SPREAD"]
+    d["BCI"]     = df.get("JP_BCI", pd.Series(index=df.index))
+
+    # Relative time axis (0 = first recession quarter)
+    start_pos = win_idx.get_loc(rec_idx[0])
+    rel_t = np.arange(len(win_idx)) - start_pos
+    shade_lo, shade_hi = start_pos, win_idx.get_loc(rec_idx[-1])
+
+    # ----- Panel 1: Real activity (indexed) -----
+    plt.figure(figsize=(10,4.5))
+    plt.plot(rel_t, d["GDP_idx"], label="GDP (index=100 at pre end)", lw=2)
+    plt.plot(rel_t, d["INV_idx"], label="Investment (index)", lw=2, linestyle="--")
+    if np.isfinite(d["EXP_idx"]).any():
+        plt.plot(rel_t, d["EXP_idx"], label="Exports (index)", lw=2, linestyle=":")
+    plt.axvspan(shade_lo, shade_hi, color='gray', alpha=0.15)
+    plt.title(f"Japan — {name}: Real Activity (Indexed)")
+    plt.ylabel("Index (base=100)"); plt.xlabel("Quarters since recession start (0)")
+    plt.legend(); plt.tight_layout(); plt.show()
+
+    # ----- Panel 2: Unemployment -----
+    plt.figure(figsize=(10,3.8))
+    plt.plot(rel_t, d["U"], color="tab:red", lw=2)
+    plt.axvspan(shade_lo, shade_hi, color='gray', alpha=0.15)
+    plt.title(f"Japan — {name}: Unemployment")
+    plt.ylabel("% of labor force"); plt.xlabel("Quarters since recession start (0)")
+    plt.tight_layout(); plt.show()
+
+    # ----- Panel 3: Inflation (+ Business Confidence on twin axis) -----
+    fig, ax1 = plt.subplots(figsize=(10,4))
+    ax1.plot(rel_t, d["INF"], color="tab:green", lw=2, label="Inflation (q/q, pp)")
+    ax1.set_ylabel("Inflation (pp q/q)", color="tab:green"); ax1.tick_params(axis='y', colors='tab:green')
+    ax1.axvspan(shade_lo, shade_hi, color='gray', alpha=0.15)
+    ax1.set_xlabel("Quarters since recession start (0)")
+    ax1.set_title(f"Japan — {name}: Prices & Confidence")
+
+    ax2 = ax1.twinx()
+    if d["BCI"].notna().any():
+        ax2.plot(rel_t, d["BCI"], color="tab:blue", lw=1.8, linestyle="-.", label="Business Confidence (index)")
+        ax2.set_ylabel("BCI (rhs)", color="tab:blue"); ax2.tick_params(axis='y', colors='tab:blue')
+        fig.legend(loc="upper left", bbox_to_anchor=(0.12, 0.95))
+    plt.tight_layout(); plt.show()
+
+   
+
+    # ----- Summary metrics (levels, not indexes) -----
+    gdd, g_qt, g_qr, g_td, g_rd = peak_trough_recovery(df["JP_GDP_LVL"], rec_start, rec_end)
+    idd, i_qt, i_qr, _, _       = peak_trough_recovery(df["JP_INV_LVL"], rec_start, rec_end)
+    if "JP_EXPORTS" in df.columns:
+        xdd, x_qt, x_qr, _, _   = peak_trough_recovery(df["JP_EXPORTS"], rec_start, rec_end)
+    else:
+        xdd, x_qt, x_qr = (np.nan, np.nan, np.nan)
+
+    summary = pd.DataFrame({
+        "Metric": [
+            "GDP peak-to-trough (%)", "Quarters to trough (GDP)", "Quarters to recovery (GDP)",
+            "Investment peak-to-trough (%)", "Quarters to trough (INV)", "Quarters to recovery (INV)",
+            "Exports peak-to-trough (%)", "Quarters to trough (EXP)", "Quarters to recovery (EXP)",
+            "Avg inflation during recession (pp q/q)",
+            "Avg long rate during recession (%)",
+            "Avg term spread during recession (pp)",
+            "Avg BCI during recession"
+        ],
+        name: [
+            gdd, g_qt, g_qr,
+            idd, i_qt, i_qr,
+            xdd, x_qt, x_qr,
+            np.round(df.loc[rec_idx, "JP_INF"].mean(), 3),
+            np.round(df.loc[rec_idx, "JP_RATE_L"].mean(), 3),
+            np.round(df.loc[rec_idx, "JP_SPREAD"].mean(), 3),
+            np.round(df.loc[rec_idx, "JP_BCI"].mean(), 3) if "JP_BCI" in df.columns else np.nan
+        ]
+    }).set_index("Metric")
+
+    return summary
+
+
+summaries = []
+
+print("\n=== GFC: PRE 2006Q3–2007Q4 | REC 2008Q1–2009Q1 | RECOVERY 2009Q2–2010Q4 ===")
+sm_gfc = run_event(
+    name="GFC (2008–2009)",
+    win_start=WIN_GFC_START, win_end=min(WIN_GFC_END, DATA_END),
+    rec_start=REC_GFC_START, rec_end=REC_GFC_END,
+    pre_start=GFC_PRE_START, pre_end=GFC_PRE_END
+)
+if sm_gfc is not None:
+    summaries.append(sm_gfc)
+
+print("\n=== COVID-19: PRE 2018Q3–2019Q4 | REC 2020Q1–2020Q2 | RECOVERY 2020Q3–2021Q4 ===")
+sm_covid = run_event(
+    name="COVID-19 (2020)",
+    win_start=WIN_COVID_START, win_end=min(WIN_COVID_END, DATA_END),
+    rec_start=REC_COVID_START, rec_end=REC_COVID_END,
+    pre_start=COVID_PRE_START, pre_end=COVID_PRE_END
+)
+if sm_covid is not None:
+    summaries.append(sm_covid)
+
+EVENT_SUMMARY_JP = pd.concat(summaries, axis=1) if summaries else pd.DataFrame()
+print("\n📊 Event Study Summary — Japan (Exports + BCI included)")
+display(EVENT_SUMMARY_JP)
+
+# Save for your report
+EVENT_SUMMARY_JP.to_csv("Event_Study_Summary_Japan_Part2.csv", encoding="utf-8", index=True)
+print("✅ Saved: Event_Study_Summary_Japan_Part2.csv")
+
+
+#---------------------------------------------------
+#PART 3: COMPUSTAT FIRM LEVEL DATA ANALYSIS
+#---------------------------------------------------
+
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+
+pd.set_option("display.max_columns", None)
+DATA_FILE = "C:/Users/ardra/OneDrive/Desktop/MACRO PRJCT 2/Compustat.csv"
+
+# Load
+df = pd.read_csv(DATA_FILE)
+df.columns = [c.upper() for c in df.columns]
+
+# Keep only the useful columns
+cols = ["GVKEY","DATADATE","SIC","SALEQ","NIQ","ATQ","CAPXY","DLTTQ","DLCQ","CHEQ"]
+df = df[cols].dropna(subset=["GVKEY","DATADATE"])
+
+# Convert date
+df["DATADATE"] = pd.to_datetime(df["DATADATE"])
+df = df.sort_values(["GVKEY","DATADATE"])
+
+
+# Focus on 2005–2012 for pre, during, post GFC
+df = df.query("'2005-01-01' <= DATADATE <= '2012-12-31'")
+
+# Remove financial firms (SIC 6000–6999)
+df = df[~df["SIC"].between(6000, 6999)]
+
+# Drop rows with zero or negative assets
+df = df[df["ATQ"] > 0]
+
+print("Firms:", df["GVKEY"].nunique(), "  Rows:", len(df))
+
+# Revenue growth (quarterly)
+df["REV_GROWTH"] = df.groupby("GVKEY")["SALEQ"].pct_change(fill_method=None)
+
+# Investment ratio
+df["INV_RATE"] = df["CAPXY"] / df["ATQ"]
+
+# Leverage ratio
+df["LEVERAGE"] = (df["DLTTQ"].fillna(0) + df["DLCQ"].fillna(0)) / df["ATQ"]
+
+# Profitability (ROA)
+df["ROA"] = df["NIQ"] / df["ATQ"]
+
+# Liquidity
+df["LIQUIDITY"] = df["CHEQ"] / df["ATQ"]
+
+# Drop extreme outliers (optional simple cleaning)
+for c in ["REV_GROWTH","INV_RATE","LEVERAGE","ROA","LIQUIDITY"]:
+    df.loc[df[c] > df[c].quantile(0.99), c] = np.nan
+    df.loc[df[c] < df[c].quantile(0.01), c] = np.nan
+
+def label_period(d):
+    if d <= pd.Timestamp("2007-06-30"): return "Pre-GFC"
+    if pd.Timestamp("2007-07-01") <= d <= pd.Timestamp("2009-12-31"): return "During-GFC"
+    if d >= pd.Timestamp("2010-01-01"): return "Post-GFC"
+    return np.nan
+
+df["PERIOD"] = df["DATADATE"].apply(label_period)
+df = df.dropna(subset=["PERIOD"])
+
+# Broad industry classification
+df["SIC2"] = (df["SIC"] // 100).astype("Int64")
+df["INDUSTRY_GROUP"] = np.where(df["SIC2"] < 40, "Manufacturing",
+                         np.where(df["SIC2"].between(70,89), "Services", "Other"))
+
+# Firm size based on average assets before crisis
+firm_size = df[df["PERIOD"]=="Pre-GFC"].groupby("GVKEY")["ATQ"].mean()
+size_cut = pd.qcut(firm_size, 2, labels=["Small","Large"])
+df = df.merge(size_cut.rename("SIZE_GROUP"), on="GVKEY", how="left")
+
+summary = df.groupby("PERIOD")[["REV_GROWTH","INV_RATE","LEVERAGE","ROA","LIQUIDITY"]].median().round(3)
+display(summary)
+
+industry_summary = df.groupby(["PERIOD","INDUSTRY_GROUP"])[["ROA","LEVERAGE","INV_RATE", "REV_GROWTH", "LIQUIDITY" ]].median().round(3)
+display(industry_summary)
+
+size_summary = df.groupby(["PERIOD","SIZE_GROUP"])[["ROA","LEVERAGE","INV_RATE"]].median().round(3)
+display(size_summary)
+
+plt.figure(figsize=(9,4))
+for g, d in df.groupby("PERIOD"):
+    plt.plot(d["DATADATE"], d["ROA"], '.', alpha=0.1, label=g)
+plt.legend(); plt.title("Firm Profitability (ROA) by Period"); plt.ylabel("ROA"); plt.show()
+
+# Average quarterly trend for ROA
+trend = df.groupby("DATADATE")["ROA"].median()
+plt.figure(figsize=(9,4))
+plt.plot(trend.index, trend.values, linewidth=2, color="darkred")
+plt.axvspan(pd.Timestamp("2007-07-01"), pd.Timestamp("2009-12-31"), color="gray", alpha=0.3)
+plt.title("Average ROA Trend (Shaded = GFC)")
+plt.show()
+df.groupby(["PERIOD","INDUSTRY_GROUP"])["ROA"].median()
+
+import matplotlib.pyplot as plt
+import numpy as np
+
+# ---- Compute period means ----
+summary = (
+    df.groupby("PERIOD")[["REV_GROWTH","INV_RATE","LEVERAGE","ROA","LIQUIDITY"]]
+      .median()
+      .reindex(["Pre-GFC","During-GFC","Post-GFC"])
+      .round(3)
+)
+
+# ---- Labels & titles ----
+indicators = ["REV_GROWTH","INV_RATE","LEVERAGE","ROA","LIQUIDITY"]
+titles = [
+    "Revenue Growth (QoQ)",
+    "Investment Rate (CAPEX / Assets)",
+    "Leverage (Debt / Assets)",
+    "Profitability (ROA)",
+    "Liquidity (Cash / Assets)"
+]
+
+# ---- Subplot layout ----
+fig, axes = plt.subplots(2, 3, figsize=(13,7))
+axes = axes.flatten()
+
+# ---- Create bar for each indicator ----
+x = np.arange(len(summary.index))  # 3 periods
+colors = ["#2ca02c", "#1f77b4", "#ff7f0e"]  # consistent color palette
+
+for i, (ax, var, title) in enumerate(zip(axes, indicators, titles)):
+    vals = summary[var].values
+    ax.bar(x, vals, color=colors)
+    ax.set_xticks(x)
+    ax.set_xticklabels(summary.index, rotation=15)
+    ax.set_title(title, fontsize=10, fontweight="bold")
+    ax.grid(axis='y', linestyle='--', alpha=0.6)
+    ax.axhline(0, color="black", linewidth=0.8)
+    if var in ["ROA","LEVERAGE","INV_RATE","LIQUIDITY"]:
+        ax.set_ylabel("")  # keep clean
+
+# ---- Remove unused subplot (since we only need 5) ----
+fig.delaxes(axes[-1])  # delete 6th panel if empty
+
+plt.suptitle("Firm-Level Indicators Before, During, and After the GFC", fontsize=13, fontweight="bold")
+plt.tight_layout(rect=[0, 0, 1, 0.96])
+plt.savefig(OUT_DIR / "subplot_all_indicators.png", dpi=150)
+plt.show()
+
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from pathlib import Path
+
+# ---- Config ----
+OUT_DIR = Path("/mnt/data/part3_outputs")
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+PERIOD_ORDER = ["Pre-GFC", "During-GFC", "Post-GFC"]
+INDUSTRY_ORDER = ["Manufacturing", "Services", "Other"]  # adjust if you used different labels
+INDICATORS = [
+    ("ROA",        "Profitability (ROA)"),
+    ("LEVERAGE",   "Leverage (Debt / Assets)"),
+    ("INV_RATE",   "Investment (CAPEX / Assets)"),
+    ("LIQUIDITY",  "Liquidity (Cash / Assets)"),
+    ("REV_GROWTH", "Revenue Growth (QoQ)")
+]
+
+# ---- Aggregate: mean by PERIOD x INDUSTRY for the indicators ----
+ind_avg = (
+    df.groupby(["PERIOD","INDUSTRY_GROUP"])[[v for v,_ in INDICATORS]]
+      .median()
+      .reset_index()
+)
+
+# ensure consistent ordering
+ind_avg["PERIOD"] = pd.Categorical(ind_avg["PERIOD"], PERIOD_ORDER, ordered=True)
+ind_avg["INDUSTRY_GROUP"] = pd.Categorical(ind_avg["INDUSTRY_GROUP"], INDUSTRY_ORDER, ordered=True)
+ind_avg = ind_avg.sort_values(["PERIOD","INDUSTRY_GROUP"]).reset_index(drop=True)
+
+# ---- Helper to fetch bar heights in correct order ----
+def get_matrix_for_indicator(indicator):
+    # rows: periods; cols: industries
+    mat = np.full((len(PERIOD_ORDER), len(INDUSTRY_ORDER)), np.nan, dtype=float)
+    for pi, p in enumerate(PERIOD_ORDER):
+        for ii, ind in enumerate(INDUSTRY_ORDER):
+            val = ind_avg.loc[
+                (ind_avg["PERIOD"]==p) & (ind_avg["INDUSTRY_GROUP"]==ind),
+                indicator
+            ]
+            if not val.empty:
+                mat[pi, ii] = float(val.iloc[0])
+    return mat  # shape (3 periods, 3 industries)
+
+# ---- Build subplots: one panel per indicator with grouped bars (industries) per period ----
+n = len(INDICATORS)
+rows, cols = 2, 3  # 5 panels -> 2x3 grid; we'll delete the extra axis
+fig, axes = plt.subplots(rows, cols, figsize=(13, 7))
+axes = axes.flatten()
+
+bar_width = 0.22
+x = np.arange(len(PERIOD_ORDER))  # positions for the three periods
+
+for i, (colname, title) in enumerate(INDICATORS):
+    ax = axes[i]
+    M = get_matrix_for_indicator(colname)  # shape (3 periods, 3 industries)
+    
+    # plot one bar series per industry, side-by-side within each period
+    for j, ind in enumerate(INDUSTRY_ORDER):
+        y = M[:, j]
+        ax.bar(x + (j - 1)*bar_width, y, width=bar_width, label=ind)
+    
+    ax.set_xticks(x)
+    ax.set_xticklabels(PERIOD_ORDER, rotation=15)
+    ax.set_title(title, fontsize=10, fontweight="bold")
+    ax.grid(axis="y", linestyle="--", alpha=0.6)
+    ax.axhline(0, color="black", linewidth=0.8)
+
+# remove the unused 6th subplot
+if n < len(axes):
+    fig.delaxes(axes[-1])
+
+# single legend for the whole figure
+handles, labels = axes[0].get_legend_handles_labels()
+fig.legend(handles, labels, title="Industry", loc="upper center", ncol=len(INDUSTRY_ORDER), bbox_to_anchor=(0.5, 1.02))
+
+plt.suptitle("Sectoral Differences by Period (Median)", fontsize=13, fontweight="bold", y=1.08)
+plt.tight_layout(rect=[0, 0, 1, 0.98])
+out_path = OUT_DIR / "subplot_sectoral_differences.png"
+plt.savefig(out_path, dpi=150, bbox_inches="tight")
+plt.show()
+
+print("Saved:", out_path)
+
+import matplotlib.pyplot as plt
+import pandas as pd
+
+# --- Compute quarterly averages (you can replace with median if you prefer) ---
+trend = (
+    df.groupby("DATADATE")[["ROA","LEVERAGE","INV_RATE","LIQUIDITY","REV_GROWTH"]]
+      .median()
+      .sort_index()
+)
+
+# --- Figure setup ---
+fig, axes = plt.subplots(2, 3, figsize=(13, 7))
+axes = axes.flatten()
+colors = ["#1f77b4", "#ff7f0e", "#2ca02c", "#9467bd", "#8c564b"]
+titles = [
+    "Profitability (ROA)",
+    "Leverage (Debt / Assets)",
+    "Investment Rate (CAPEX / Assets)",
+    "Liquidity (Cash / Assets)",
+    "Revenue Growth (QoQ)"
+]
+
+# --- Define GFC shading window ---
+GFC_START = pd.Timestamp("2007-07-01")
+GFC_END   = pd.Timestamp("2009-12-31")
+
+# --- Plot each indicator ---
+for i, col in enumerate(trend.columns):
+    ax = axes[i]
+    ax.plot(trend.index, trend[col], color=colors[i], linewidth=2)
+    ax.axvspan(GFC_START, GFC_END, color="gray", alpha=0.25)  # shaded GFC window
+    ax.set_title(titles[i], fontsize=10, fontweight="bold")
+    ax.grid(alpha=0.5)
+    ax.axhline(0, color="black", linewidth=0.8)
+    ax.set_xlim(trend.index.min(), trend.index.max())
+    ax.set_xlabel("Year")
+    ax.set_ylabel(col)
+
+# --- Remove empty last subplot (2x3 grid has one extra) ---
+fig.delaxes(axes[-1])
+
+plt.suptitle("Firm Behavior Dashboard: Key Indicators Before, During, and After the GFC",
+             fontsize=13, fontweight="bold", y=1.03)
+plt.tight_layout(rect=[0, 0, 1, 0.98])
+plt.savefig(OUT_DIR / "firm_behavior_dashboard.png", dpi=150, bbox_inches="tight")
+plt.show()
+print("Saved: firm_behavior_dashboard.png")
